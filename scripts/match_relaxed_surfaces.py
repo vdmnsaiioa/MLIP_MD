@@ -33,6 +33,12 @@ interfaces.csv lists all interfaces, smallest first (column rank).
 Numbering: a new --outdir is numbered by size (000 = fewest atoms). Re-running into an existing
 --outdir (e.g. after adding facets) keeps the folder of every interface found before, so the
 registry scans and MD inside it stay where they are; new interfaces get the next free numbers.
+A re-run with another --separation, --lco-vacuum or --lpo-vacuum would change the structures in
+those folders, so it needs another --outdir (or --overwrite).
+
+Picking an interface by name (find_interface, used by mp_to_interf_relax.py and md_interface.py):
+the name is matched on the slabs and faces, e.g. 001_LCO_113_s1-bot__LPO_110_s2-bot, so the number
+and the atom count, which can differ between models and runs, may be left out or differ.
 
 The default --outdir follows the surfaces directory: mh1_surfaces -> mh1_interfaces, uma_surfaces
 -> uma_interfaces. An --outdir made from another surfaces directory is not overwritten unless
@@ -48,8 +54,10 @@ Examples
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -150,12 +158,64 @@ def load_slabs(root: Path, args) -> dict:
 
 
 def check_outdir(outdir: Path, args) -> None:
-    """Do not overwrite interfaces built from another surfaces directory (unless --overwrite)."""
+    """Do not overwrite interfaces built from another surfaces directory or with another geometry
+    (unless --overwrite)."""
     f = outdir / "run_args.json"
-    if f.exists() and not args.overwrite:
-        old = Path(json.loads(f.read_text()).get("surfaces_dir", ""))
-        if old.name != Path(args.surfaces_dir).name:
-            raise SystemExit(f"{outdir} was made from {old}; use another --outdir or --overwrite")
+    if not f.exists() or args.overwrite:
+        return
+    old = json.loads(f.read_text())
+    if Path(old.get("surfaces_dir", "")).name != Path(args.surfaces_dir).name:
+        raise SystemExit(f"{outdir} was made from {old.get('surfaces_dir')}; use another --outdir or --overwrite")
+    changed = [f"{k} {old[k]} -> {getattr(args, k)}" for k in ("separation", "lco_vacuum", "lpo_vacuum")
+               if k in old and old[k] != getattr(args, k)]
+    if changed:
+        raise SystemExit(f"{outdir} was made with other interface geometry ({', '.join(changed)}); its folders "
+                         f"(and any scans in them) would no longer fit: use another --outdir or --overwrite")
+
+
+INTERFACE_NAME = re.compile(r"^(?:(?P<num>\d{3})_)?(?P<core>.+?)(?:_(?P<atoms>\d+)at)?$")
+
+
+def split_interface_name(name: str) -> tuple[str | None, str, int | None]:
+    """'001_LCO_113_s1-bot__LPO_110_s2-bot_432at' -> ('001', 'LCO_113_s1-bot__LPO_110_s2-bot', 432);
+    the number and the atom count are optional."""
+    m = INTERFACE_NAME.match(Path(str(name).rstrip("/")).name)
+    return m["num"], m["core"], (int(m["atoms"]) if m["atoms"] else None)
+
+
+def find_interface(interfaces_dir: Path, spec: str | None = None) -> tuple[Path, str]:
+    """An interface folder of interfaces_dir (listed in its interfaces.csv) and why it was chosen.
+    No spec: the smallest lattice mismatch (largest principal strain), fewest atoms on ties.
+    A spec is matched on the slabs and faces; when several cells share them, a given atom count,
+    then a given number, decides, else the smallest mismatch."""
+    table = Path(interfaces_dir) / "interfaces.csv"
+    if not table.exists():
+        raise SystemExit(f"{table} not found - run the lattice matching first")
+    with open(table, newline="") as fh:
+        rows = [r for r in csv.DictReader(fh) if (table.parent / r["directory"]).is_dir()]
+    if not rows:
+        raise SystemExit(f"no interfaces in {table}")
+
+    def best(rs):
+        return min(rs, key=lambda r: (float(r["max_strain_pct"]), int(r["n_atoms"])))
+
+    if not spec:
+        r = best(rows)
+        return table.parent / r["directory"], (f"smallest lattice mismatch: {r['max_strain_pct']} %, "
+                                              f"{r['n_atoms']} atoms")
+    num, core, atoms = split_interface_name(spec)
+    parts = {r["directory"]: split_interface_name(r["directory"]) for r in rows}
+    cands = [r for r in rows if parts[r["directory"]][1] == core]
+    if not cands:
+        known = sorted({f"{v[1]} ({k})" for k, v in parts.items()})
+        raise SystemExit(f"no interface {core} in {table}; there are:\n  " + "\n  ".join(known))
+    for value, i in ((atoms, 2), (num, 0)):
+        sub = [r for r in cands if value is not None and parts[r["directory"]][i] == value]
+        if sub:
+            cands = sub
+    r = best(cands)
+    return table.parent / r["directory"], (f"{spec} matched on slabs and faces: {r['max_strain_pct']} %, "
+                                          f"{r['n_atoms']} atoms")
 
 
 # =============================================================================

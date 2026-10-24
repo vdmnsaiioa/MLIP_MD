@@ -2,13 +2,17 @@
 """
 md_interface.py
 ===============
-Molecular dynamics of a relaxed LCO | LPO interface with MACE-MH-1 (--backend mace, default) or UMA
-(--backend uma, omat task): an anneal first, then NVT runs at several temperatures for Li
-transport. Analyse the output with analyse_md.py. Model options: see mlip_calculators.py.
+Molecular dynamics of a relaxed LCO | LPO interface with the potential chosen by --model (mace-mh =
+MACE-MH-1, default; uma-omat = UMA-S, omat task; see mlip_calculators.py): an anneal first, then
+NVT runs at several temperatures for Li transport. --analyse runs analyse_md.py at the end.
 
 Start structure
   The lowest-energy converged structure in results.csv of a registry scan (relax_interface_scan.py),
   or the one named with --structure. The LCO / LPO labels of the atoms come from scan_info.json.
+  Give the scan directory, or --interfaces <run>_interfaces with --interface NAME (default: the
+  interface with the smallest lattice mismatch, as in mp_to_interf_relax.py). NAME is matched on the
+  slabs and faces, e.g. 001_LCO_113_s1-bot__LPO_110_s2-bot, so the folder number and atom count may
+  differ. The scan may come from a run with another model than the MD.
 
 Stages (--stages, default: both)
   anneal      Langevin: --anneal-equil-ps at --T-low, linear heating to --anneal-T over --heat-ps,
@@ -35,7 +39,8 @@ Restarting
   can be resubmitted with the same command; finished phases are skipped. Rerunning with a larger
   --prod-ps extends a finished production run.
 
-Output (--outdir, default <interface dir>/md)
+Output (--outdir, default <interface dir>/md_<model>; an existing <interface dir>/md made with
+the same model, by an earlier version of this script, is continued)
   md_info.json   start structure, LPO atom indices, frozen atoms, model, settings. A directory
                  belongs to one start structure, supercell, frozen region and model; the script
                  stops instead of continuing a trajectory with another one.
@@ -55,7 +60,9 @@ Examples
   python md_interface.py mh1_interfaces/001_LCO_113_s1-bot__LPO_110_s2-bot_432at/registry_scan
   python md_interface.py <scan dir> --stages anneal                            # job 1
   python md_interface.py <scan dir> --stages production --temperatures 800     # then one job per T
-  python md_interface.py uma_interfaces/<interface>/registry_scan --backend uma --repeat 2 1
+  python md_interface.py --interfaces uma_interfaces --model uma-omat --repeat 2 1 --analyse
+  python md_interface.py --interfaces mh1_interfaces --interface 001_LCO_113_s1-bot__LPO_110_s2-bot \
+      --model uma-omat --repeat 2 1                  # interface relaxed with MACE, MD with UMA
 """
 from __future__ import annotations
 
@@ -97,9 +104,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Anneal + NVT MD of an LCO | LPO interface with MACE-MH-1 or UMA (see module docstring).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("scan_dir", help="registry scan directory (scan_interface_registry.py + relax_interface_scan.py)")
+    p.add_argument("scan_dir", nargs="?",
+                   help="registry scan directory (scan_interface_registry.py + relax_interface_scan.py); "
+                        "or use --interfaces")
+    p.add_argument("--interfaces", help="interfaces folder of a run (e.g. uma_interfaces): use the scan of --interface")
+    p.add_argument("--interface", default=None,
+                   help="interface in --interfaces, e.g. 001_LCO_113_s1-bot__LPO_110_s2-bot "
+                        "(default: smallest lattice mismatch)")
     p.add_argument("--structure", help="structure of the scan to start from (default: lowest relaxed energy)")
-    p.add_argument("--outdir", help="output directory (default: <interface dir>/md)")
+    p.add_argument("--outdir", help="output directory (default: <interface dir>/md_<model>)")
+    p.add_argument("--analyse", action="store_true", help="run analyse_md.py on the output at the end")
     p.add_argument("--stages", nargs="+", choices=["anneal", "production"], default=["anneal", "production"])
     p.add_argument("--repeat", type=int, nargs=2, default=[1, 1], metavar=("N1", "N2"),
                    help="in-plane supercell of the interface for MD, e.g. 2 1 for a cell that is narrow along a")
@@ -128,7 +142,23 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--min-dist", type=float, default=0.7, help="stop if two atoms come closer than this (A)")
     g.add_argument("--seed", type=int, default=0, help="random seed (offset by T for each production run)")
     add_model_args(p, dtype_default="float32", uma_settings_default="default", cueq=True)
-    return resolve_model_args(p.parse_args(argv))
+    args = resolve_model_args(p.parse_args(argv))
+    args.interface = args.interface or None          # "" from a batch script = default
+    args.outdir = args.outdir or None
+    if not args.scan_dir and not args.interfaces:
+        p.error("give a registry scan directory or --interfaces")
+    return args
+
+
+def default_outdir(scan: Path, args) -> Path:
+    """<interface dir>/md_<model>, or <interface dir>/md if an earlier version ran this model there."""
+    base = scan.resolve().parent
+    legacy = base / "md" / "md_info.json"
+    if legacy.exists():
+        old = json.loads(legacy.read_text())
+        if (old.get("model"), old.get("head")) == (args.checkpoint, args.head):
+            return legacy.parent
+    return base / f"md_{args.model}"
 
 
 # =============================================================================
@@ -342,8 +372,15 @@ def production(start, calc, args, out: Path, T: float) -> None:
 # =============================================================================
 def main(argv=None) -> None:
     args = parse_args(argv)
-    scan = Path(args.scan_dir)
-    out = Path(args.outdir) if args.outdir else scan.resolve().parent / "md"
+    if args.scan_dir:
+        scan = Path(args.scan_dir)
+    else:
+        from match_relaxed_surfaces import find_interface
+
+        iface, why = find_interface(Path(args.interfaces), args.interface)
+        print(f"interface: {iface.name} ({why})")
+        scan = iface / "registry_scan"
+    out = Path(args.outdir) if args.outdir else default_outdir(scan, args)
     out.mkdir(parents=True, exist_ok=True)
     scan_info = json.loads((scan / "scan_info.json").read_text())
     name, e_scan = pick_start(scan, args.structure)
@@ -374,7 +411,8 @@ def main(argv=None) -> None:
                 or old.get("frozen_indices") != info["frozen_indices"]):
             raise SystemExit(f"{info_path} belongs to another start structure, --repeat or --fix-bottom; "
                              f"use another --outdir")
-        if (old.get("model"), old.get("head"), bool(old.get("dispersion"))) != (args.model, args.head, args.dispersion):
+        if (old.get("model"), old.get("head"), bool(old.get("dispersion"))) != (args.checkpoint, args.head,
+                                                                               args.dispersion):
             raise SystemExit(f"{info_path} belongs to {old.get('model')} (head {old.get('head')}); the trajectories "
                              f"cannot be continued with another model - use another --outdir")
     else:
@@ -397,6 +435,10 @@ def main(argv=None) -> None:
             prod_start = start
         for T in args.temperatures:
             production(prod_start, calc, args, out, T)
+    if args.analyse:
+        from analyse_md import main as analyse
+
+        analyse([str(out)])
 
 
 if __name__ == "__main__":

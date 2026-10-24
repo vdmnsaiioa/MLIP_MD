@@ -3,8 +3,8 @@
 relax_interface_scan.py
 =======================
 Single points and relaxations of every structure written by scan_interface_registry.py, with the
-work of adhesion of each, using MACE-MH-1 (--backend mace, default) or UMA (--backend uma, omat
-task); see mlip_calculators.py for the model options.
+work of adhesion of each, using the potential chosen with --model (mace-mh = MACE-MH-1, default;
+uma-omat = UMA-S, omat task; see mlip_calculators.py).
 
 For every structure in <scan dir>/scan.csv
   1. single point of the structure as generated (the rigid registry/gap scan),
@@ -39,7 +39,7 @@ mlip_calculators.py. Untested on real data.
 
 Examples
   python relax_interface_scan.py mh1_interfaces/001_LCO_113_s1-bot__LPO_110_s2-bot_432at/registry_scan
-  python relax_interface_scan.py uma_interfaces/<interface>/registry_scan --backend uma
+  python relax_interface_scan.py uma_interfaces/<interface>/registry_scan --model uma-omat
 """
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 # =============================================================================
 def model_tag(args) -> dict:
     """What makes two energies comparable (precision settings are not part of it)."""
-    return dict(model=args.model, head=args.head, dispersion=bool(args.dispersion))
+    return dict(model=args.checkpoint, head=args.head, dispersion=bool(args.dispersion))
 
 
 def check_model(scan: Path, args) -> None:

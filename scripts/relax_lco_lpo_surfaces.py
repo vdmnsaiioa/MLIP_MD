@@ -5,18 +5,18 @@ relax_lco_lpo_surfaces.py
 Relax bulk LiCoO2 (LCO) and Li3PO4 (LPO) and all their candidate surfaces - atomic positions
 AND in-plane lattice - with a foundation model, MACE-MH-1 or UMA, before any lattice matching.
 
-Model (--backend, see mlip_calculators.py)
-  mace  MACE-MH-1 (mace-foundations), head omat_pbe by default: trained on OMat (periodic
-        materials, PBE/PBE+U), the level of the MP cells used in the screening; matpes_r2scan is
-        the r2SCAN alternative.
-  uma   UMA (fairchem-core), uma-s-1p2p1 with the omat task by default (OMat24, PBE/PBE+U).
+Model (--model, see mlip_calculators.py)
+  mace-mh   MACE-MH-1 (mace-foundations), omat_pbe head: trained on OMat (periodic materials,
+            PBE/PBE+U), the level of the MP cells used in the screening.
+  uma-omat  UMA-S 1.2.1 (fairchem-core, uma-s-1p2p1), omat task (OMat24, PBE/PBE+U).
   Both are short-range models without explicit electrostatics, so treat polar terminations with
   care. Slabs are fully periodic with --vacuum, which must be wider than the model's cutoff
   (6 A for both) so that the two faces do not interact through it.
 
 Pipeline
   1. Bulk cells from the Materials Project (as in lco_lpo_lattice_match.py), --lco-id / --lpo-id,
-     or local files.
+     or local files. An MP cell saved in --outdir/bulk by an earlier run is reused instead of
+     querying MP again, so all runs in a folder start from the same MP data.
   2. Full bulk relaxation (positions + cell, space group kept). bulk.csv compares MP and model
      lattice parameters; --bulk-only stops here so you can check them first.
   3. Facets: the screening's "reasonable" Miller indices (Donnay-Harker ranking of the MP cell,
@@ -39,7 +39,7 @@ Repeating a run with another model: --like DIR
   same model and --outdir DIR, it extends DIR instead, e.g. by --extra-lco-millers (finished slabs
   are skipped).
 
-Output (--outdir; default mh1_surfaces for MACE, uma_surfaces for UMA)
+Output (--outdir; default <tag>_surfaces: mh1_surfaces for mace-mh, uma_surfaces for uma-omat)
   bulk/, bulk.csv          input and relaxed bulk cells (<side>_<mpid>_MACE_conv.vasp or ..._UMA_..);
                            MP vs model lattice parameters
   surfaces/<name>/         POSCAR_initial, POSCAR_relaxed, relaxed.extxyz, relax.traj, relax.log,
@@ -47,9 +47,10 @@ Output (--outdir; default mh1_surfaces for MACE, uma_surfaces for UMA)
   surfaces.csv             per slab: initial and relaxed in-plane lattice, relaxation strain,
                            formal-charge dipole, unrelaxed and relaxed surface energy, convergence
   skipped.csv, pairs.csv   slabs not relaxed and why; (LCO hkl, LPO hkl) -> relaxed slab names
-Re-running skips slabs whose info.json was made with the same --model and --head
-(--overwrite to redo them). A directory holding the results of another model is not touched
-unless --overwrite is given.
+Re-running skips slabs whose info.json was made with the same model and head (--overwrite to
+redo them). A directory made with another model, other slab settings (thicknesses, vacuum, ftol,
+symprec, fmax, fix-bottom, symmetry) or another MP structure is not touched unless --overwrite is
+given: use another --outdir.
 
 Surface energy = (E_slab - N e_bulk) / (2 A), the mean of the two faces of a stoichiometric
 slab; for polar (Tasker type 3) slabs it is not a clean surface property.
@@ -61,8 +62,8 @@ lco_lpo_lattice_match.py and make_lco_lpo_terminations.py (helpers are imported)
 Examples
   python relax_lco_lpo_surfaces.py --bulk-only            # check the bulk lattices first
   python relax_lco_lpo_surfaces.py --lco-thickness 15 --lpo-thickness 15 --vacuum 20
-  python relax_lco_lpo_surfaces.py --backend uma --like mh1_surfaces             # -> uma_surfaces
-  python relax_lco_lpo_surfaces.py --backend uma --like mh1_surfaces --extra-lco-millers 012 021
+  python relax_lco_lpo_surfaces.py --model uma-omat --like mh1_surfaces           # -> uma_surfaces
+  python relax_lco_lpo_surfaces.py --model uma-omat --like mh1_surfaces --extra-lco-millers 012 021
 """
 from __future__ import annotations
 
@@ -92,11 +93,14 @@ from lco_lpo_lattice_match import (angle_deg, fmt_hkl, make_phase, parse_millers
                                    phases_from_mp, reduce_2d, select_facets, strain_metrics)
 from make_lco_lpo_terminations import (bulk_coordination, cartesian_ops, coordination, layer_cuts, make_slab,
                                        ouc_frame, parse_pairs, unit)
-from mlip_calculators import add_model_args, get_calculator, model_info, model_label, resolve_model_args
+from mlip_calculators import (add_model_args, args_record, get_calculator, model_info, model_label,
+                              resolve_model_args)
 
 EV_PER_A2_TO_J_PER_M2 = 16.021766
 OPTIMIZERS = {"FIRE": FIRE, "BFGS": BFGS, "LBFGS": LBFGS}
-DEFAULT_OUTDIR = {"mace": "mh1_surfaces", "uma": "uma_surfaces"}
+# settings that define the slabs: a folder made with other values is not reused
+SLAB_KEYS = ("lco_thickness", "lpo_thickness", "vacuum", "ftol", "symprec", "no_fix_symmetry", "fmax_bulk", "fmax",
+             "fix_bottom")
 # settings that --like copies from the run_args.json of the earlier run
 LIKE_KEYS = ("symprec", "max_index", "n_facets", "ranking", "lco_thickness", "lpo_thickness", "vacuum", "ftol",
              "max_slabs", "bonds", "keep_broken", "charges", "optimizer", "fmax_bulk", "fmax", "max_steps",
@@ -152,7 +156,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--no-fix-symmetry", action="store_true", help="do not constrain the bulk space group")
     g.add_argument("--fix-bottom", type=float, default=0.0,
                    help="freeze atoms within this distance (A) of the slab bottom (0 = all atoms free)")
-    g.add_argument("--outdir", default=None, help="output directory (default: mh1_surfaces / uma_surfaces)")
+    g.add_argument("--outdir", default=None, help="output directory (default: <model tag>_surfaces)")
     g.add_argument("--overwrite", action="store_true",
                    help="re-relax slabs that already have info.json; allow an --outdir of another model")
 
@@ -161,7 +165,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.set_defaults(**like_defaults(Path(pre.like)))
     args = resolve_model_args(p.parse_args(argv))
     if args.outdir is None:
-        args.outdir = DEFAULT_OUTDIR[args.backend]
+        args.outdir = f"{args.tag}_surfaces"
     return args
 
 
@@ -218,14 +222,37 @@ def write_csv(rows: list[dict], path: Path) -> None:
 
 
 def check_outdir(outdir: Path, args) -> None:
-    """Refuse to mix the results of two models in one directory (unless --overwrite)."""
+    """Refuse to mix the results of two models or two sets of slab settings in one directory
+    (unless --overwrite)."""
     f = outdir / "run_args.json"
     if not f.exists() or args.overwrite:
         return
     old = json.loads(f.read_text())
-    if (old.get("model"), old.get("head")) != (args.model, args.head):
+    if (old.get("model"), old.get("head")) != (args.checkpoint, args.head):
         raise SystemExit(f"{outdir} holds results of {old.get('model')} ({old.get('head')}); use another --outdir "
                          f"or --overwrite to replace them")
+    changed = [f"{k} {old[k]} -> {getattr(args, k)}" for k in SLAB_KEYS if k in old and old[k] != getattr(args, k)]
+    if changed:
+        raise SystemExit(f"{outdir} was made with other slab settings ({', '.join(changed)}), so its slabs would not "
+                         f"fit; use another --outdir (mp_to_interf_relax.py: --run-name) or --overwrite")
+
+
+def mp_id(label) -> str | None:
+    m = re.search(r"mp-\d+", str(label or ""))
+    return m.group(0) if m else None
+
+
+def check_inputs(outdir: Path, inp: dict, args) -> None:
+    """Refuse to add slabs of another MP structure to a directory (unless --overwrite)."""
+    f = outdir / "bulk.csv"
+    if not f.exists() or args.overwrite:
+        return
+    with open(f, newline="") as fh:
+        old = {r["material"]: r["mpid"] for r in csv.DictReader(fh)}
+    for side, ph in inp.items():
+        a, b = mp_id(old.get(side)), mp_id(ph.mpid)
+        if a and b and a != b:
+            raise SystemExit(f"{outdir} holds {side} {a}, this run uses {b}; use another --outdir or --overwrite")
 
 
 # =============================================================================
@@ -352,7 +379,7 @@ def main(argv=None) -> None:
     check_outdir(outdir, args)
     (outdir / "bulk").mkdir(parents=True, exist_ok=True)
     (outdir / "surfaces").mkdir(exist_ok=True)
-    (outdir / "run_args.json").write_text(json.dumps(vars(args), indent=2))
+    (outdir / "run_args.json").write_text(json.dumps(args_record(args), indent=2))
     spec = {
         "LCO": dict(formula=args.lco_formula, mpid=args.lco_id, file=args.lco_file, millers=args.lco_millers,
                     extra=args.extra_lco_millers, thickness=args.lco_thickness),
@@ -370,6 +397,11 @@ def main(argv=None) -> None:
                 ph = dataclasses.replace(ph, mpid=tag)
                 print(f"  {side}: id {tag} from the file name")
             inp[side] = ph
+    for side, sp in spec.items():                   # MP cell saved by an earlier run in this folder
+        saved = outdir / "bulk" / f"{side}_{sp['mpid']}_input_conv.vasp"
+        if side not in inp and sp["mpid"] and saved.exists():
+            inp[side] = dataclasses.replace(phases_from_files([str(saved)], side, args.symprec)[0], mpid=sp["mpid"])
+            print(f"  {side}: {sp['mpid']} from {saved} (saved by an earlier run, no MP query)")
     if len(inp) < 2:
         from mp_api.client import MPRester
 
@@ -378,6 +410,8 @@ def main(argv=None) -> None:
                 if side not in inp:
                     ids = [sp["mpid"]] if sp["mpid"] else None
                     inp[side] = phases_from_mp(mpr, sp["formula"], ids, 1, args, side)[0]
+
+    check_inputs(outdir, inp, args)
 
     # ---- 2. bulk relaxation ------------------------------------------------------------
     calc = get_calculator(args)
@@ -391,7 +425,7 @@ def main(argv=None) -> None:
         rel[side].conv.to(filename=str(outdir / "bulk" / f"{side}_{ph.mpid}_{label}_conv.vasp"), fmt="poscar")
         l0, l1 = ph.conv.lattice, rel[side].conv.lattice
         row = dict(material=side, mpid=ph.mpid, spacegroup=ph.spacegroup, spacegroup_relaxed=rel[side].spacegroup,
-                   model=args.model, head=args.head, backend=args.backend)
+                   model=args.checkpoint, head=args.head, model_name=args.model, backend=args.backend)
         for key, v0, v1 in zip(("a", "b", "c", "alpha", "beta", "gamma"), (*l0.abc, *l0.angles), (*l1.abc, *l1.angles)):
             row[f"{key}_MP"], row[f"{key}_{label}"] = round(v0, 4), round(v1, 4)
         row.update({"V_MP": round(l0.volume, 3), f"V_{label}": round(l1.volume, 3),
@@ -439,7 +473,7 @@ def main(argv=None) -> None:
                 d = outdir / "surfaces" / name
                 if (d / "info.json").exists() and not args.overwrite:
                     old = json.loads((d / "info.json").read_text())
-                    if old.get("model") == args.model and old.get("head") == args.head:
+                    if old.get("model") == args.checkpoint and old.get("head") == args.head:
                         rows.append(old)
                         by_facet[(side, hkl)].append(name)
                         print(f"  {name}: already relaxed with this model/head, skipped")
