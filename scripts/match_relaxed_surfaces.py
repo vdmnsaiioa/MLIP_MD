@@ -18,7 +18,7 @@ Faces
   POSCAR_relaxed touches LPO, "bottom" = slab turned over; LPO "bottom" = its bottom face touches
   LCO, "top" = slab turned over. Turning over is a proper rotation (180 deg about x), not a mirror.
 
-Each interface directory (ranked by atom count) contains
+Each interface directory NNN_<LCO slab>-<face>__<LPO slab>-<face>_<atoms>at contains
   POSCAR_interface   LCO supercell + LPO supercell strained onto the LCO cell; c perpendicular to
                      the interface; --lco-vacuum below LCO, --separation between the parts,
                      --lpo-vacuum above LPO
@@ -28,13 +28,22 @@ Each interface directory (ranked by atom count) contains
                      those of POSCAR_interface gives exactly the strained LPO of the interface
   summary.txt/.json  mismatch, cells, supercell matrices, atoms, volume, thicknesses, dipoles and
                      the source slabs (surface energies, polarity, convergence)
-interfaces.csv lists all interfaces.
+interfaces.csv lists all interfaces, smallest first (column rank).
+
+Numbering: a new --outdir is numbered by size (000 = fewest atoms). Re-running into an existing
+--outdir (e.g. after adding facets) keeps the folder of every interface found before, so the
+registry scans and MD inside it stay where they are; new interfaces get the next free numbers.
+
+The default --outdir follows the surfaces directory: mh1_surfaces -> mh1_interfaces, uma_surfaces
+-> uma_interfaces. An --outdir made from another surfaces directory is not overwritten unless
+--overwrite is given (its interface directories may hold registry scans and MD).
 
 Run next to lco_lpo_lattice_match.py and make_lco_lpo_terminations.py (helpers are imported).
 Untested.
 
-Example
+Examples
   python match_relaxed_surfaces.py mh1_surfaces --max-strain 0.01 --max-atoms 1000
+  python match_relaxed_surfaces.py uma_surfaces --max-strain 0.01 --max-atoms 1000   # -> uma_interfaces
 """
 from __future__ import annotations
 
@@ -79,8 +88,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--symprec", type=float, default=0.1, help="tolerance (A) for detecting symmetric slabs")
     p.add_argument("--include-unconverged", action="store_true", help="also use slabs whose relaxation did not converge")
     p.add_argument("--max-interfaces", type=int, default=0, help="write only the N smallest interfaces (0 = all)")
-    p.add_argument("--outdir", default="mh1_interfaces", help="output directory")
-    return p.parse_args(argv)
+    p.add_argument("--outdir", default=None,
+                   help="output directory (default: the surfaces directory name with 'surfaces' -> 'interfaces')")
+    p.add_argument("--overwrite", action="store_true", help="allow an --outdir made from another surfaces directory")
+    args = p.parse_args(argv)
+    if args.outdir is None:
+        src = Path(args.surfaces_dir).resolve()
+        name = src.name[: -len("surfaces")] + "interfaces" if src.name.endswith("surfaces") else src.name + "_interfaces"
+        args.outdir = str(src.parent / name)
+    return args
 
 
 # =============================================================================
@@ -109,12 +125,13 @@ def symmetric(atoms, symprec: float) -> bool:
 
 
 def load_slabs(root: Path, args) -> dict:
-    slabs = {"LCO": [], "LPO": []}
+    slabs, models = {"LCO": [], "LPO": []}, set()
     for d in sorted((root / "surfaces").iterdir()):
         info_f, pos_f = d / "info.json", d / "POSCAR_relaxed"
         if not (info_f.exists() and pos_f.exists()):
             continue
         info = json.loads(info_f.read_text())
+        models.add((str(info.get("model")), str(info.get("head"))))
         if not info.get("converged", False) and not args.include_unconverged:
             print(f"  {d.name}: relaxation not converged - not used")
             continue
@@ -127,7 +144,18 @@ def load_slabs(root: Path, args) -> dict:
         slabs[info["material"]].append(Slab(
             name=d.name, info=info, species=atoms.get_chemical_symbols(), pos=atoms.positions.copy(),
             mesh=mesh, n=len(atoms), area=float(np.linalg.norm(np.cross(mesh[0], mesh[1]))), flips=flips))
+    if len(models) > 1:
+        print("  ! the slabs come from more than one model: " + "; ".join(f"{m} ({h})" for m, h in sorted(models)))
     return slabs
+
+
+def check_outdir(outdir: Path, args) -> None:
+    """Do not overwrite interfaces built from another surfaces directory (unless --overwrite)."""
+    f = outdir / "run_args.json"
+    if f.exists() and not args.overwrite:
+        old = Path(json.loads(f.read_text()).get("surfaces_dir", ""))
+        if old.name != Path(args.surfaces_dir).name:
+            raise SystemExit(f"{outdir} was made from {old}; use another --outdir or --overwrite")
 
 
 # =============================================================================
@@ -277,7 +305,8 @@ def summarise(rank: int, name: str, m: dict, b: dict, charges: dict, args) -> tu
     sc, fc = data["lco_surface_cell"], data["lpo_surface_cell"]
     ss, fs = data["lco_supercell"], data["lpo_supercell_unstrained"]
     lines = [
-        f"Interface {rank:03d}: {s.name} ({face_s} face) | {f.name} ({face_f} face)",
+        f"Interface {name.split('_', 1)[0]}: {s.name} ({face_s} face) | {f.name} ({face_f} face); "
+        f"rank {rank} by size in this run",
         f"  LCO ({data['lco_hkl']}) at the bottom, LPO ({data['lpo_hkl']}) on top; "
         f"{data['n_atoms']} atoms = {data['n_lco']} LCO + {data['n_lpo']} LPO",
         "",
@@ -340,13 +369,21 @@ def main(argv=None) -> None:
         found = found[: args.max_interfaces]
 
     outdir = Path(args.outdir)
+    check_outdir(outdir, args)
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "run_args.json").write_text(json.dumps(vars(args), indent=2))
+    # folders of a previous run, by interface: they keep their number (scans and MD may live in them)
+    existing = {d.name[4:]: d.name for d in outdir.glob("[0-9][0-9][0-9]_*") if d.is_dir()}
+    next_id = 1 + max((int(n[:3]) for n in existing.values()), default=-1)
     rows = []
     for rank, m in enumerate(found):
         face_s = "top" if m["flip_s"] == 0 else "bot"
         face_f = "bot" if m["flip_f"] == 0 else "top"
-        name = f"{rank:03d}_{m['s'].name}-{face_s}__{m['f'].name}-{face_f}_{m['n_atoms']}at"
+        tag = f"{m['s'].name}-{face_s}__{m['f'].name}-{face_f}_{m['n_atoms']}at"
+        if tag in existing:
+            name = existing[tag]
+        else:
+            name, next_id = f"{next_id:03d}_{tag}", next_id + 1
         d = outdir / name
         d.mkdir(exist_ok=True)
         b = build_interface(m, args)

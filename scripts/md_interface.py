@@ -2,8 +2,9 @@
 """
 md_interface.py
 ===============
-MACE-MH-1 molecular dynamics of a relaxed LCO | LPO interface: an anneal first, then NVT runs at
-several temperatures for Li transport. Analyse the output with analyse_md.py.
+Molecular dynamics of a relaxed LCO | LPO interface with MACE-MH-1 (--backend mace, default) or UMA
+(--backend uma, omat task): an anneal first, then NVT runs at several temperatures for Li
+transport. Analyse the output with analyse_md.py. Model options: see mlip_calculators.py.
 
 Start structure
   The lowest-energy converged structure in results.csv of a registry scan (relax_interface_scan.py),
@@ -12,7 +13,8 @@ Start structure
 Stages (--stages, default: both)
   anneal      Langevin: --anneal-equil-ps at --T-low, linear heating to --anneal-T over --heat-ps,
               --hold-ps at --anneal-T, linear cooling back to --T-low over --cool-ps; then a
-              relaxation of all atoms (float64). anneal/POSCAR_annealed is the result; anneal.json
+              relaxation of all atoms at full precision (float64 for MACE, the FP32 "batch" preset
+              for UMA). anneal/POSCAR_annealed is the result; anneal.json
               compares its energy with the start structure (lower = the anneal found a better
               interface).
   production  For every T in --temperatures: velocities at T, --equil-ps of Langevin, then --prod-ps
@@ -34,20 +36,26 @@ Restarting
   --prod-ps extends a finished production run.
 
 Output (--outdir, default <interface dir>/md)
-  md_info.json   start structure, LPO atom indices, frozen atoms, settings
+  md_info.json   start structure, LPO atom indices, frozen atoms, model, settings. A directory
+                 belongs to one start structure, supercell, frozen region and model; the script
+                 stops instead of continuing a trajectory with another one.
   start/         POSCAR of the start structure
   anneal/        anneal.traj, anneal.log, POSCAR_annealed, anneal.json, relax.log
   T0800/ ...     equil.traj, equil.log, prod.traj, prod.log, run.json   (one directory per T)
 
-Speed: the log prints ps/day after the first chunk. MACE-MH-1 is a large model, so check that
-before committing to ns runs; --cueq switches on cuEquivariance kernels if they are installed.
+Precision and speed: MD runs in float32 for MACE (--dtype) and with the fastest UMA preset,
+"default" (UMA Nitro on Ampere or newer GPUs, reduced precision; --uma-settings high-precision for
+full FP32). The log prints ps/day after the first ps: check it before committing to ns runs.
+MACE-MH-1 is a large model; --cueq switches on cuEquivariance kernels if they are installed.
 
-Requirements: mace-torch >= 0.3.14, ase >= 3.23, numpy. Untested on real data.
+Requirements: ase >= 3.23, numpy, and mace-torch >= 0.3.14 or fairchem-core >= 2.24. Run next to
+mlip_calculators.py. Untested on real data.
 
 Examples
   python md_interface.py mh1_interfaces/001_LCO_113_s1-bot__LPO_110_s2-bot_432at/registry_scan
   python md_interface.py <scan dir> --stages anneal                            # job 1
   python md_interface.py <scan dir> --stages production --temperatures 800     # then one job per T
+  python md_interface.py uma_interfaces/<interface>/registry_scan --backend uma --repeat 2 1
 """
 from __future__ import annotations
 
@@ -65,7 +73,7 @@ from ase.io import read, write
 from ase.io.trajectory import Trajectory
 from ase.md import MDLogger
 from ase.md.langevin import Langevin
-from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
+from ase.md.velocitydistribution import Stationary
 from ase.neighborlist import neighbor_list
 from ase.optimize import FIRE
 
@@ -73,13 +81,20 @@ try:
     from ase.md.bussi import Bussi                  # ase >= 3.23
 except ImportError:
     Bussi = None
+try:
+    from ase.md.velocitydistribution import thermalize_momenta      # ase >= 3.29
+except ImportError:
+    from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 
-MACE_MH_1 = "https://github.com/ACEsuit/mace-foundations/releases/download/mace_mh_1/mace-mh-1.model"
+    def thermalize_momenta(atoms, temperature_K, exact_temperature=False, rng=None):
+        MaxwellBoltzmannDistribution(atoms, temperature_K=temperature_K, force_temp=exact_temperature, rng=rng)
+
+from mlip_calculators import add_model_args, get_calculator, model_info, needs_precise_copy, resolve_model_args
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Anneal + NVT MD of an LCO | LPO interface with MACE-MH-1 (see module docstring).",
+        description="Anneal + NVT MD of an LCO | LPO interface with MACE-MH-1 or UMA (see module docstring).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("scan_dir", help="registry scan directory (scan_interface_registry.py + relax_interface_scan.py)")
@@ -112,30 +127,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--fix-bottom", type=float, default=2.0, help="freeze LCO atoms within this distance of the LCO bottom (A)")
     g.add_argument("--min-dist", type=float, default=0.7, help="stop if two atoms come closer than this (A)")
     g.add_argument("--seed", type=int, default=0, help="random seed (offset by T for each production run)")
-    g = p.add_argument_group("model")
-    g.add_argument("--model", default=MACE_MH_1, help="MACE-MH-1 checkpoint URL or local path")
-    g.add_argument("--head", default="omat_pbe", help="model head")
-    g.add_argument("--dispersion", action="store_true", help="add D3 dispersion")
-    g.add_argument("--device", default="auto", help="cuda, cpu or auto")
-    g.add_argument("--dtype", choices=["float32", "float64"], default="float32",
-                   help="precision for MD (the final relaxation always uses float64)")
-    g.add_argument("--cueq", action="store_true", help="use cuEquivariance kernels (must be installed)")
-    return p.parse_args(argv)
-
-
-def get_calculator(args, dtype: str):
-    """MACE-MH-1 ASE calculator with the chosen head (downloaded to ~/.cache/mace if a URL)."""
-    from mace.calculators import mace_mp
-
-    device = args.device
-    if device == "auto":
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    extra = {"enable_cueq": True} if args.cueq else {}
-    print(f"loading {args.model}\n  head {args.head}, {dtype}, D3 {'on' if args.dispersion else 'off'}, {device}"
-          + (", cuEquivariance" if args.cueq else ""))
-    return mace_mp(model=args.model, head=args.head, dispersion=args.dispersion, default_dtype=dtype,
-                   device=device, **extra)
+    add_model_args(p, dtype_default="float32", uma_settings_default="default", cueq=True)
+    return resolve_model_args(p.parse_args(argv))
 
 
 # =============================================================================
@@ -227,7 +220,7 @@ def run_phase(d: Path, name: str, start, calc, args, steps: int, T_of_step, kind
             return atoms
         print(f"  {d.name}/{name}: resuming at step {step0} of {steps}")
     elif not np.any(atoms.get_momenta()):
-        MaxwellBoltzmannDistribution(atoms, temperature_K=T_of_step(0), force_temp=True, rng=rng)
+        thermalize_momenta(atoms, T_of_step(0), exact_temperature=True, rng=rng)
         Stationary(atoms)
     if traj_path.exists() and not resumed:              # unreadable leftovers of an earlier attempt
         traj_path.rename(traj_path.with_suffix(".traj.bak"))
@@ -297,16 +290,16 @@ def anneal(start, calc, args, out: Path, e_start_scan) -> None:
     rng = np.random.default_rng(args.seed)
     atoms = run_phase(d, "anneal", start, calc, args, int(edges[-1]), T_of_step, "langevin", rng)
 
-    print("anneal: relaxing the cooled structure (all atoms, float64)")
-    calc64 = get_calculator(args, "float64") if args.dtype != "float64" else calc
+    print("anneal: relaxing the cooled structure (all atoms, full precision)")
+    calc_relax = get_calculator(args, precise=True) if needs_precise_copy(args) else calc
     ref = start.copy()
     ref.set_constraint()
-    ref.calc = calc64
+    ref.calc = calc_relax
     e_start = float(ref.get_potential_energy())
     relaxed = atoms.copy()
     relaxed.set_constraint()
     relaxed.set_momenta(np.zeros((len(relaxed), 3)))
-    relaxed.calc = calc64
+    relaxed.calc = calc_relax
     opt = FIRE(relaxed, logfile=str(d / "relax.log"))
     conv = opt.run(fmax=args.fmax, steps=args.max_steps)
     if conv is None:
@@ -374,19 +367,22 @@ def main(argv=None) -> None:
     info = dict(scan_dir=str(scan.resolve()), start_structure=name, E_relaxed_scan_eV_per_cell=e_scan,
                 repeat=args.repeat, n_atoms=len(start), lpo_indices=np.nonzero(is_lpo)[0].tolist(),
                 frozen_indices=frozen.tolist(), fix_bottom_A=args.fix_bottom, area_A2=scan_info["area_A2"] * n_rep,
-                model=args.model, head=args.head, dispersion=args.dispersion, md_dtype=args.dtype)
+                **model_info(args))
     if info_path.exists():
         old = json.loads(info_path.read_text())
         if (old.get("start_structure") != name or old.get("repeat") != args.repeat
                 or old.get("frozen_indices") != info["frozen_indices"]):
             raise SystemExit(f"{info_path} belongs to another start structure, --repeat or --fix-bottom; "
                              f"use another --outdir")
+        if (old.get("model"), old.get("head"), bool(old.get("dispersion"))) != (args.model, args.head, args.dispersion):
+            raise SystemExit(f"{info_path} belongs to {old.get('model')} (head {old.get('head')}); the trajectories "
+                             f"cannot be continued with another model - use another --outdir")
     else:
         info_path.write_text(json.dumps(info, indent=2))
     print(f"start: {name} ({len(start)} atoms" + (f", {args.repeat[0]} x {args.repeat[1]} cells" if n_rep > 1 else "")
           + f"), {len(frozen)} frozen LCO atoms; output in {out}/")
 
-    calc = get_calculator(args, args.dtype)
+    calc = get_calculator(args)
     if "anneal" in args.stages:
         anneal(start, calc, args, out, e_scan)
     if "production" in args.stages:

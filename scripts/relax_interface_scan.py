@@ -2,8 +2,9 @@
 """
 relax_interface_scan.py
 =======================
-MACE-MH-1 single points and relaxations of every structure written by scan_interface_registry.py,
-with the work of adhesion of each.
+Single points and relaxations of every structure written by scan_interface_registry.py, with the
+work of adhesion of each, using MACE-MH-1 (--backend mace, default) or UMA (--backend uma, omat
+task); see mlip_calculators.py for the model options.
 
 For every structure in <scan dir>/scan.csv
   1. single point of the structure as generated (the rigid registry/gap scan),
@@ -29,11 +30,16 @@ Output (inside the scan directory)
 single points, --only NAME ... restricts the run to some structures. Re-running skips finished work
 done on the same POSCAR with the same --model, --head and --dispersion (and --fix-bottom and --fmax
 for relaxations), so an interrupted job can simply be restarted; --overwrite redoes everything.
+A scan directory holds the results of one model: a run with another --model / --head / --dispersion
+stops unless --overwrite is given. To compare two models on the same structures, write a second
+copy of the scan with scan_interface_registry.py --outdir and run the other model there.
 
-Requirements: mace-torch >= 0.3.14, ase >= 3.23, numpy. Untested on real data.
+Requirements: ase >= 3.23, numpy, and mace-torch >= 0.3.14 or fairchem-core >= 2.24. Run next to
+mlip_calculators.py. Untested on real data.
 
-Example
+Examples
   python relax_interface_scan.py mh1_interfaces/001_LCO_113_s1-bot__LPO_110_s2-bot_432at/registry_scan
+  python relax_interface_scan.py uma_interfaces/<interface>/registry_scan --backend uma
 """
 from __future__ import annotations
 
@@ -51,7 +57,8 @@ from ase.io import read, write
 from ase.io.trajectory import Trajectory
 from ase.optimize import BFGS, FIRE, LBFGS
 
-MACE_MH_1 = "https://github.com/ACEsuit/mace-foundations/releases/download/mace_mh_1/mace-mh-1.model"
+from mlip_calculators import add_model_args, get_calculator, model_info, resolve_model_args
+
 EV_PER_A2_TO_J_PER_M2 = 16.021766
 OPTIMIZERS = {"FIRE": FIRE, "BFGS": BFGS, "LBFGS": LBFGS}
 RELAX_KEYS = ("relax_tag", "E_relaxed", "converged", "steps", "error", "gap_final_A", "min_contact_final_A",
@@ -60,16 +67,11 @@ RELAX_KEYS = ("relax_tag", "E_relaxed", "converged", "steps", "error", "gap_fina
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="MACE-MH-1 single points and relaxations of a registry/gap scan (see module docstring).",
+        description="MACE-MH-1 or UMA single points and relaxations of a registry/gap scan (see module docstring).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("scan_dir", help="output directory of scan_interface_registry.py")
-    g = p.add_argument_group("model")
-    g.add_argument("--model", default=MACE_MH_1, help="MACE-MH-1 checkpoint URL or local path")
-    g.add_argument("--head", default="omat_pbe", help="model head (omat_pbe, matpes_r2scan, ...)")
-    g.add_argument("--dispersion", action="store_true", help="add D3 dispersion (off = as the slab relaxations)")
-    g.add_argument("--device", default="auto", help="cuda, cpu or auto")
-    g.add_argument("--dtype", choices=["float32", "float64"], default="float64", help="model precision")
+    add_model_args(p, dtype_default="float64", uma_settings_default="batch")
     g = p.add_argument_group("relaxation")
     g.add_argument("--optimizer", choices=list(OPTIMIZERS), default="FIRE", help="ASE optimizer")
     g.add_argument("--fmax", type=float, default=0.02, help="force convergence (eV/A)")
@@ -81,28 +83,26 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--no-relax", action="store_true", help="single points only (rigid scan)")
     g.add_argument("--only", nargs="+", help="structure names to run (default: all in scan.csv)")
     g.add_argument("--traj", action="store_true", help="also write relax.traj for every relaxation")
-    g.add_argument("--overwrite", action="store_true", help="redo finished single points and relaxations")
-    return p.parse_args(argv)
-
-
-def get_calculator(args):
-    """MACE-MH-1 ASE calculator with the chosen head (downloaded to ~/.cache/mace if a URL)."""
-    from mace.calculators import mace_mp
-
-    device = args.device
-    if device == "auto":
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"loading {args.model}\n  head {args.head}, {args.dtype}, D3 {'on' if args.dispersion else 'off'}, {device}")
-    return mace_mp(model=args.model, head=args.head, dispersion=args.dispersion, default_dtype=args.dtype,
-                   device=device)
+    g.add_argument("--overwrite", action="store_true",
+                   help="redo finished single points and relaxations, also those of another model")
+    return resolve_model_args(p.parse_args(argv))
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
 def model_tag(args) -> dict:
+    """What makes two energies comparable (precision settings are not part of it)."""
     return dict(model=args.model, head=args.head, dispersion=bool(args.dispersion))
+
+
+def check_model(scan: Path, args) -> None:
+    """Stop if the scan directory already holds results of another model (unless --overwrite)."""
+    tag = load_json(scan / "reference" / "ref.json").get("tag")
+    if tag and not args.overwrite and not same(tag, model_tag(args)):
+        raise SystemExit(f"{scan} holds results of {tag.get('model')} (head {tag.get('head')}, D3 {tag.get('dispersion')}); "
+                         f"--overwrite replaces them, or write a copy of the scan with scan_interface_registry.py "
+                         f"--outdir and run this model there")
 
 
 def relax_tag(args) -> dict:
@@ -210,6 +210,7 @@ def references(scan: Path, calc, args) -> dict:
     refs = load_json(path)
     if args.overwrite or not same(refs.get("tag", {}), model_tag(args)):
         refs = {"tag": model_tag(args)}
+    refs.setdefault("model_info", model_info(args))       # settings of the run that made these energies
     for key in ("LCO", "LPO"):
         r = refs.get(key, {})
         src = rd / f"POSCAR_{key}"
@@ -252,6 +253,7 @@ def main(argv=None) -> None:
     print(f"{scan}: {len(rows)} structures of {info['n_atoms']} atoms ({info['n_lco']} LCO + {info['n_lpo']} LPO), "
           f"area {area:.2f} A^2")
 
+    check_model(scan, args)
     calc = get_calculator(args)
     refs = references(scan, calc, args)
 

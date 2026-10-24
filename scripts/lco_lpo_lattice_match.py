@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import csv
 import inspect
+import itertools
 import json
 import math
 import re
@@ -79,7 +80,6 @@ from scipy.linalg import eigh
 
 from pymatgen.analysis.interfaces.zsl import ZSLGenerator
 from pymatgen.core import Structure
-from pymatgen.core.surface import get_symmetrically_distinct_miller_indices
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
 MP_FIELDS = ["material_id", "formula_pretty", "symmetry", "energy_above_hull", "structure", "theoretical"]
@@ -317,11 +317,27 @@ def canonical_hkl(hkl, symops) -> tuple[int, int, int]:
     return min(cands, key=lambda t: (sum(x < 0 for x in t), tuple(-x for x in t)))
 
 
+def distinct_millers(phase: Phase, max_index: int) -> list[tuple[int, int, int]]:
+    """Miller indices up to max_index that are distinct under the crystal's own Laue group
+    (point group + inversion), as canonical representatives. pymatgen's
+    get_symmetrically_distinct_miller_indices was not used: for R-3m LiCoO2 it merged (0 1 2) with
+    (1 0 2), which only the hexagonal lattice relates, and (1 0 2) is systematically absent."""
+    seen, out = set(), []
+    rng = range(-max_index, max_index + 1)
+    for hkl in itertools.product(rng, rng, rng):
+        if not any(hkl) or reduce(math.gcd, (abs(x) for x in hkl)) != 1:
+            continue
+        canon = canonical_hkl(hkl, phase.symops)
+        if canon not in seen:
+            seen.add(canon)
+            out.append(canon)
+    return out
+
+
 def select_facets(phase: Phase, max_index: int, n_facets: int, ranking: str, explicit=None) -> list[Facet]:
     if explicit:
         return [facet_geometry(phase, hkl) for hkl in explicit]
-    millers = get_symmetrically_distinct_miller_indices(phase.conv, max_index)
-    facets = [facet_geometry(phase, canonical_hkl(hkl, phase.symops)) for hkl in millers]
+    facets = [facet_geometry(phase, hkl) for hkl in distinct_millers(phase, max_index)]
     if ranking == "dh":
         facets.sort(key=lambda f: (-round(f.d_dh, 4), -round(f.d, 4), max(abs(x) for x in f.hkl), f.hkl))
     else:
