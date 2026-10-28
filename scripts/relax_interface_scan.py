@@ -3,8 +3,9 @@
 relax_interface_scan.py
 =======================
 Single points and relaxations of every structure written by scan_interface_registry.py, with the
-work of adhesion of each, using the potential chosen with --model (mace-mh = MACE-MH-1, default;
-uma-omat = UMA-S, omat task; see mlip_calculators.py).
+work of adhesion of each, using the pretrained model chosen with --model (mace-mh = MACE-MH-1,
+default; uma-omat, esen-omat, eqv2-omat, sevennet-ompa, grace-omat, or a published name such as
+EquiformerV2-31M-OMAT24; see mlip_calculators.py).
 
 For every structure in <scan dir>/scan.csv
   1. single point of the structure as generated (the rigid registry/gap scan),
@@ -71,7 +72,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("scan_dir", help="output directory of scan_interface_registry.py")
-    add_model_args(p, dtype_default="float64", uma_settings_default="batch")
+    add_model_args(p, dtype_default="float64", uma_settings_default="batch", cueq=True)
     g = p.add_argument_group("relaxation")
     g.add_argument("--optimizer", choices=list(OPTIMIZERS), default="FIRE", help="ASE optimizer")
     g.add_argument("--fmax", type=float, default=0.02, help="force convergence (eV/A)")
@@ -100,7 +101,7 @@ def check_model(scan: Path, args) -> None:
     """Stop if the scan directory already holds results of another model (unless --overwrite)."""
     tag = load_json(scan / "reference" / "ref.json").get("tag")
     if tag and not args.overwrite and not same(tag, model_tag(args)):
-        raise SystemExit(f"{scan} holds results of {tag.get('model')} (head {tag.get('head')}, D3 {tag.get('dispersion')}); "
+        raise SystemExit(f"{scan} holds results of {tag.get('model')} (head {tag.get('head') or '-'}, D3 {tag.get('dispersion')}); "
                          f"--overwrite replaces them, or write a copy of the scan with scan_interface_registry.py "
                          f"--outdir and run this model there")
 

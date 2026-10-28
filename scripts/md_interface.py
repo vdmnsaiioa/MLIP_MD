@@ -2,9 +2,10 @@
 """
 md_interface.py
 ===============
-Molecular dynamics of a relaxed LCO | LPO interface with the potential chosen by --model (mace-mh =
-MACE-MH-1, default; uma-omat = UMA-S, omat task; see mlip_calculators.py): an anneal first, then
-NVT runs at several temperatures for Li transport. --analyse runs analyse_md.py at the end.
+Molecular dynamics of a relaxed LCO | LPO interface with the pretrained model chosen by --model (a
+short name, mace-mh (default), uma-omat, esen-omat, eqv2-omat, sevennet-ompa or grace-omat, or a
+published name such as EquiformerV2-31M-OMAT24; see mlip_calculators.py): an anneal first, then NVT
+runs at several temperatures for Li transport. --analyse runs analyse_md.py at the end.
 
 Start structure
   The lowest-energy converged structure in results.csv of a registry scan (relax_interface_scan.py),
@@ -166,6 +167,9 @@ def default_outdir(scan: Path, args) -> Path:
 # =============================================================================
 def pick_start(scan: Path, name: str | None) -> tuple[str, float | None]:
     """Name and relaxed energy of the start structure (lowest converged energy in results.csv)."""
+    if not (scan / "results.csv").exists():
+        raise SystemExit(f"{scan}/results.csv not found - relax the scan first (relax_interface_scan.py, "
+                         f"step 4 of mp_to_interf_relax.py)")
     with open(scan / "results.csv", newline="") as fh:
         rows = [r for r in csv.DictReader(fh) if r.get("E_relaxed_eV")]
     if not rows:
@@ -381,9 +385,9 @@ def main(argv=None) -> None:
         print(f"interface: {iface.name} ({why})")
         scan = iface / "registry_scan"
     out = Path(args.outdir) if args.outdir else default_outdir(scan, args)
+    name, e_scan = pick_start(scan, args.structure)
     out.mkdir(parents=True, exist_ok=True)
     scan_info = json.loads((scan / "scan_info.json").read_text())
-    name, e_scan = pick_start(scan, args.structure)
     start = read(str(scan / name / "POSCAR_relaxed"), format="vasp")
     start.set_constraint()
     start.set_momenta(np.zeros((len(start), 3)))
@@ -413,7 +417,7 @@ def main(argv=None) -> None:
                              f"use another --outdir")
         if (old.get("model"), old.get("head"), bool(old.get("dispersion"))) != (args.checkpoint, args.head,
                                                                                args.dispersion):
-            raise SystemExit(f"{info_path} belongs to {old.get('model')} (head {old.get('head')}); the trajectories "
+            raise SystemExit(f"{info_path} belongs to {old.get('model')} (head {old.get('head') or '-'}); the trajectories "
                              f"cannot be continued with another model - use another --outdir")
     else:
         info_path.write_text(json.dumps(info, indent=2))

@@ -3,15 +3,16 @@
 relax_lco_lpo_surfaces.py
 =========================
 Relax bulk LiCoO2 (LCO) and Li3PO4 (LPO) and all their candidate surfaces - atomic positions
-AND in-plane lattice - with a foundation model, MACE-MH-1 or UMA, before any lattice matching.
+AND in-plane lattice - with a foundation model (--model) before any lattice matching.
 
-Model (--model, see mlip_calculators.py)
-  mace-mh   MACE-MH-1 (mace-foundations), omat_pbe head: trained on OMat (periodic materials,
-            PBE/PBE+U), the level of the MP cells used in the screening.
-  uma-omat  UMA-S 1.2.1 (fairchem-core, uma-s-1p2p1), omat task (OMat24, PBE/PBE+U).
-  Both are short-range models without explicit electrostatics, so treat polar terminations with
-  care. Slabs are fully periodic with --vacuum, which must be wider than the model's cutoff
-  (6 A for both) so that the two faces do not interact through it.
+Model (--model, see mlip_calculators.py): a short name, mace-mh (MACE-MH-1, omat_pbe head), uma-omat
+  (UMA-S 1.2.1, omat task), esen-omat (eSEN-30M-OMAT24), eqv2-omat (EquiformerV2-86M-OMAT24),
+  sevennet-ompa (SevenNet-MF-ompa, omat24 modal) or grace-omat (GRACE-2L-OMAT), or the published
+  name of another pretrained model (e.g. EquiformerV2-31M-OMAT24): trained on OMat-level data
+  (PBE/PBE+U), the level of the MP cells used in the screening.
+  These are short-range models without explicit electrostatics, so treat polar terminations with
+  care. Slabs are fully periodic with --vacuum, which must be wider than the model's cutoff so that
+  the two faces do not interact through it (the default 20 A is well above the cutoffs of these models).
 
 Pipeline
   1. Bulk cells from the Materials Project (as in lco_lpo_lattice_match.py), --lco-id / --lpo-id,
@@ -39,8 +40,8 @@ Repeating a run with another model: --like DIR
   same model and --outdir DIR, it extends DIR instead, e.g. by --extra-lco-millers (finished slabs
   are skipped).
 
-Output (--outdir; default <tag>_surfaces: mh1_surfaces for mace-mh, uma_surfaces for uma-omat)
-  bulk/, bulk.csv          input and relaxed bulk cells (<side>_<mpid>_MACE_conv.vasp or ..._UMA_..);
+Output (--outdir; default <tag>_surfaces, e.g. mh1_surfaces for mace-mh, uma_surfaces for uma-omat)
+  bulk/, bulk.csv          input and relaxed bulk cells (<side>_<mpid>_<label>_conv.vasp, label MACE, UMA, ...);
                            MP vs model lattice parameters
   surfaces/<name>/         POSCAR_initial, POSCAR_relaxed, relaxed.extxyz, relax.traj, relax.log,
                            info.json
@@ -145,7 +146,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--charges", nargs="+", default=["Li:1", "Co:3", "P:5", "O:-2"],
                    help="formal charges for the reported slab dipole")
 
-    add_model_args(p, dtype_default="float64", uma_settings_default="batch")
+    add_model_args(p, dtype_default="float64", uma_settings_default="batch", cueq=True)
 
     g = p.add_argument_group("relaxation and output")
     g.add_argument("--bulk-only", action="store_true", help="relax the bulk cells, write bulk.csv and stop")
@@ -229,8 +230,9 @@ def check_outdir(outdir: Path, args) -> None:
         return
     old = json.loads(f.read_text())
     if (old.get("model"), old.get("head")) != (args.checkpoint, args.head):
-        raise SystemExit(f"{outdir} holds results of {old.get('model')} ({old.get('head')}); use another --outdir "
-                         f"or --overwrite to replace them")
+        head = f" ({old.get('head')})" if old.get("head") else ""
+        raise SystemExit(f"{outdir} holds results of {old.get('model')}{head}; use another --outdir "
+                         f"(mp_to_interf_relax.py: --run-name) or --overwrite to replace them")
     changed = [f"{k} {old[k]} -> {getattr(args, k)}" for k in SLAB_KEYS if k in old and old[k] != getattr(args, k)]
     if changed:
         raise SystemExit(f"{outdir} was made with other slab settings ({', '.join(changed)}), so its slabs would not "
@@ -372,7 +374,7 @@ def save_extxyz(atoms: Atoms, energy: float, forces, path: Path) -> None:
 # =============================================================================
 def main(argv=None) -> None:
     args = parse_args(argv)
-    label = model_label(args)                       # MACE or UMA, for file names and columns
+    label = model_label(args)                       # MACE, UMA, eSEN, ...: file names and columns
     bonds = {} if [t.lower() for t in args.bonds] == ["none"] else parse_pairs(args.bonds, "-")
     charges = parse_pairs(args.charges, "")
     outdir = Path(args.outdir)

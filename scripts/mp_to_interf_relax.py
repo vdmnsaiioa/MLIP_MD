@@ -20,8 +20,12 @@ larger --early-stop, or resubmitted after the wall-time limit. The folders of a 
 model and one set of slab and interface settings: the steps refuse to mix them, so give a run with
 other settings its own --run-name.
 
-Model (--model): mace-mh (MACE-MH-1, omat_pbe head) or uma-omat (UMA-S 1.2.1, omat task); more can
-be added in mlip_calculators.py (MODELS).
+Model (--model): the pretrained model, as a short name, mace-mh (MACE-MH-1), uma-omat (UMA-S 1.2.1,
+omat task), esen-omat (eSEN-30M-OMAT24), eqv2-omat (EquiformerV2-86M-OMAT24), sevennet-ompa
+(SevenNet-MF-ompa, omat24 modal) or grace-omat (GRACE-2L-OMAT), or as the name its package publishes it
+under, e.g. uma-m-1p1, EquiformerV2-31M-OMAT24, 7net-omni or GRACE-2L-OMAT-medium-base (see
+mlip_calculators.py). --checkpoint (a local file) / --head (head, task or modal) change the model of a
+run; give such a run its own --run-name.
 
 Interface for steps 3 and 4 (--interface)
   Default: the interface with the smallest lattice mismatch (largest principal strain of LPO in
@@ -29,9 +33,10 @@ Interface for steps 3 and 4 (--interface)
   001_LCO_113_s1-bot__LPO_110_s2-bot: it is matched on the slabs and faces, so the number and the atom
   count (_432at), which can differ between models and runs, may be left out or differ.
 
-Output names: <run> = --run-name, by default the folder tag of the model (mh1 for mace-mh, uma for
-uma-omat, so earlier folders are continued). <run>_workflow.json records the parameters of the last
-run, the interface it used and the time of each step.
+Output names: <run> = --run-name, by default the folder tag of the model (mh1, uma, esen, eqv2,
+7net, grace for the short names, mh1 and uma continuing the earlier folders; the name itself for other
+models, e.g. EquiformerV2-31M-OMAT24). <run>_workflow.json records the parameters of the last run, the
+interface it used and the time of each step.
 
 Every parameter of the four scripts that matters is an option here (see --help); the batch script
 mp_to_interf_relax.sh sets them all. The defaults are those of the MACE-MH-1 run.
@@ -52,7 +57,7 @@ import sys
 import time
 from pathlib import Path
 
-from mlip_calculators import MODELS, UMA_SETTINGS
+from mlip_calculators import MODELS, UMA_SETTINGS, model_entry
 
 STEPS = {1: "bulk and slabs (relax_lco_lpo_surfaces.py)",
          2: "lattice matching (match_relaxed_surfaces.py)",
@@ -93,15 +98,22 @@ def parse_args(argv=None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     g = p.add_argument_group("run and model")
-    g.add_argument("--model", required=True, choices=list(MODELS),
-                   help="potential for all calculations: " + "; ".join(f"{k} = {v['description']}"
-                                                                       for k, v in MODELS.items()))
+    g.add_argument("--model", required=True,
+                   help="pretrained model for all calculations: a short name (" + "; ".join(
+                       f"{k} = {v['description']}" for k, v in MODELS.items()) + ") or a published name, e.g. "
+                        "EquiformerV2-31M-OMAT24, uma-m-1p1, 7net-omni, GRACE-2L-OMAT-medium-base")
     g.add_argument("--run-name", type=optional, default=None,
                    help="prefix of the output folders (<run>_surfaces, <run>_interfaces); default: the model's tag")
+    g.add_argument("--checkpoint", type=optional, default=None,
+                   help="other checkpoint for the model's package, e.g. a local file (default: the model's own)")
+    g.add_argument("--head", type=optional, default=None,
+                   help="head / task / modal of the model, e.g. mpa for SevenNet (default: the model's own)")
     g.add_argument("--early-stop", type=early_stop, default=None, help="None = all steps; 1, 2 or 3 = stop after it")
     g.add_argument("--device", default="auto", help="cuda, cpu or auto")
     g.add_argument("--dtype", choices=["float32", "float64"], default="float64", help="MACE precision")
     g.add_argument("--uma-settings", choices=UMA_SETTINGS, default="batch", help="UMA inference preset")
+    g.add_argument("--cueq", type=yes_no, default=False,
+                   help="cuEquivariance kernels for MACE / SevenNet (faster, less GPU memory; must be installed)")
 
     g = p.add_argument_group("step 1: bulk and slabs (relax_lco_lpo_surfaces.py)")
     g.add_argument("--lco-id", default="mp-22526", help="Materials Project id of LCO")
@@ -157,7 +169,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         setattr(args, key, None if not tokens or [t.lower() for t in tokens] == ["auto"] else tokens)
     for key in ("extra_lco_millers", "extra_lpo_millers"):
         setattr(args, key, [t for t in getattr(args, key) if t.strip() and t.lower() != "none"])
-    args.run_name = args.run_name or MODELS[args.model]["tag"]
+    entry = model_entry(args.model)                 # unknown names stop here
+    args.model = entry["model"]                     # e.g. uma-s-1p2p1 -> uma-omat
+    args.run_name = args.run_name or entry["tag"]
     return args
 
 
@@ -165,7 +179,13 @@ def parse_args(argv=None) -> argparse.Namespace:
 # Steps
 # =============================================================================
 def model_argv(args) -> list[str]:
-    return ["--model", args.model, "--device", args.device, "--dtype", args.dtype, "--uma-settings", args.uma_settings]
+    argv = ["--model", args.model, "--device", args.device, "--dtype", args.dtype, "--uma-settings", args.uma_settings]
+    for flag, value in (("--checkpoint", args.checkpoint), ("--head", args.head)):
+        if value:
+            argv += [flag, value]
+    if args.cueq:
+        argv.append("--cueq")
+    return argv
 
 
 def step1(args, surf: Path) -> None:
@@ -239,7 +259,10 @@ def main(argv=None) -> None:
     last = args.early_stop or 4
     record_path = Path(f"{args.run_name}_workflow.json")
     record = dict(parameters=vars(args), started=time.strftime("%Y-%m-%d %H:%M:%S"), steps={})
-    print(f"model {args.model} ({MODELS[args.model]['description']}); run '{args.run_name}': "
+    variant = "".join(f", {k} {v}" for k, v in (("checkpoint", args.checkpoint), ("head", args.head)) if v)
+    desc = model_entry(args.model)["description"]
+    name = desc if desc.startswith(args.model) else f"{args.model} ({desc})"
+    print(f"model {name}{variant}; run '{args.run_name}': "
           f"{surf}/, {ifaces}/; steps 1-{last}" + (f" (--early-stop {args.early_stop})" if args.early_stop else ""))
 
     iface = None

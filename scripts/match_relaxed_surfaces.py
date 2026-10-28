@@ -194,7 +194,8 @@ def find_interface(interfaces_dir: Path, spec: str | None = None) -> tuple[Path,
     with open(table, newline="") as fh:
         rows = [r for r in csv.DictReader(fh) if (table.parent / r["directory"]).is_dir()]
     if not rows:
-        raise SystemExit(f"no interfaces in {table}")
+        raise SystemExit(f"no interfaces in {table}: the lattice matching found none within its --max-strain "
+                         f"and --max-atoms")
 
     def best(rs):
         return min(rs, key=lambda r: (float(r["max_strain_pct"]), int(r["n_atoms"])))
@@ -453,7 +454,10 @@ def main(argv=None) -> None:
         (d / "summary.txt").write_text("\n".join(lines) + "\n")
         (d / "summary.json").write_text(json.dumps(data, indent=2))
         rows.append({k: v for k, v in data.items() if not isinstance(v, dict)})
-    write_csv(rows, outdir / "interfaces.csv")
+    if rows:
+        write_csv(rows, outdir / "interfaces.csv")
+    else:                                            # no stale table from an earlier run
+        (outdir / "interfaces.csv").write_text("")
     n_small = sum(r["n_atoms"] <= 300 for r in rows)
     print(f"\n{len(rows)} interfaces written to {outdir}/ ({n_small} with <= 300 atoms); overview in interfaces.csv")
 

@@ -19,9 +19,23 @@
 # settings needs its own RUN_NAME.
 
 # ===== model and run ===========================================================================
-MODEL=uma-omat             # mace-mh (MACE-MH-1, omat_pbe head) | uma-omat (UMA-S 1.2.1, omat task)
-RUN_NAME=                  # folders <RUN_NAME>_surfaces, <RUN_NAME>_interfaces; empty = mh1 / uma
+MODEL=uma-omat             # pretrained model for steps 1-4: a short name (output folders)
+                           #   mace-mh        MACE-MH-1, omat_pbe head          (mh1_*)
+                           #   uma-omat       UMA-S 1.2.1, omat task            (uma_*)
+                           #   esen-omat      eSEN-30M-OMAT24                   (esen_*)
+                           #   eqv2-omat      EquiformerV2-86M-OMAT24           (eqv2_*)
+                           #   sevennet-ompa  SevenNet-MF-ompa, omat24 modal    (7net_*)
+                           #   grace-omat     GRACE-2L-OMAT                     (grace_*)
+                           # or the published name of a pretrained model (folders <name>_*), e.g.
+                           #   uma-m-1p1, EquiformerV2-31M-OMAT24, EquiformerV2-153M-OMAT24, eSEN-30M-OAM,
+                           #   7net-omni, 7net-omat, GRACE-2L-OMAT-medium-base, GRACE-2L-SMAX-OMAT-medium
+                           #   (the names of the models above, e.g. uma-s-1p2p1, run as their short name)
+CHECKPOINT=                # optional local checkpoint file for MODEL's package (then also set RUN_NAME)
+HEAD=                      # optional head/task/modal, e.g. mpa for SevenNet (then also set RUN_NAME)
+RUN_NAME=                  # folders <RUN_NAME>_surfaces, <RUN_NAME>_interfaces; empty = the model's folders
 EARLY_STOP=None            # None = all 4 steps; 1, 2 or 3 = stop after that step
+CUEQ=false                 # true: cuEquivariance kernels (MACE, SevenNet; must be installed),
+                           #   less GPU memory: advised for SevenNet
 
 # ===== step 1: bulk and slabs ==================================================================
 LCO_ID=mp-22526            # Materials Project ids (MP_API_KEY in ~/.bashrc; cells already saved in
@@ -68,19 +82,25 @@ INTERFACE_FIX_BOTTOM=0     # freeze LCO atoms within this distance of its bottom
 TOP=0                      # relax only the TOP lowest single points; 0 = all
 
 # ===== environment =============================================================================
+shopt -s nocasematch       # conda environment of each package
 case $MODEL in
-    mace-mh)  ENV=vasp_stuff ;;
-    uma-omat) ENV=uma ;;
-    *) echo "set the conda environment for MODEL=$MODEL in this script"; exit 1 ;;
+    mace-*)                         ENV=vasp_stuff ;;
+    uma-*)                          ENV=uma ;;
+    esen-*|eqv2-*|equiformerv2-*)   ENV=fairchem1 ;;
+    sevennet-*|7net-*)              ENV=sevenn ;;
+    grace-*|grace_*)                ENV=grace ;;
+    *) echo "no conda environment for MODEL=$MODEL: add it to the case list in this script"; exit 1 ;;
 esac
+shopt -u nocasematch
 source /home/energy/s234633/anaconda3/etc/profile.d/conda.sh
 conda activate $ENV
 cd /home/energy/s234633/LCO_LPO_thesis || exit 1
-export HF_HUB_OFFLINE=1    # UMA weights are downloaded once on the login node, not in the job
+export HF_HUB_OFFLINE=1    # gated weights (UMA, eSEN, EquiformerV2) are downloaded on the login node, not in the job
 nvidia-smi
 
 python scripts/mp_to_interf_relax.py \
-    --model $MODEL --run-name "$RUN_NAME" --early-stop $EARLY_STOP \
+    --model $MODEL --checkpoint "$CHECKPOINT" --head "$HEAD" --cueq $CUEQ \
+    --run-name "$RUN_NAME" --early-stop $EARLY_STOP \
     --lco-id $LCO_ID --lpo-id $LPO_ID --lco-file "$LCO_FILE" --lpo-file "$LPO_FILE" \
     --n-facets $N_FACETS --max-index $MAX_INDEX \
     --lco-millers $LCO_MILLERS --lpo-millers $LPO_MILLERS \
