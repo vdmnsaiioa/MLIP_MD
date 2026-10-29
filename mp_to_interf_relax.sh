@@ -44,8 +44,10 @@ LCO_FILE=                  # or local bulk files instead of MP, e.g. the cells o
 LPO_FILE=                  #   mh1_surfaces/bulk/LCO_mp-22526_input_conv.vasp, .../LPO_mp-13725_input_conv.vasp
 N_FACETS=8                 # facets per material, best Donnay-Harker ranked, Miller indices up to MAX_INDEX
 MAX_INDEX=4
-LCO_MILLERS=auto           # auto = ranked list, or explicit facets, e.g. "001 104 012"
-LPO_MILLERS=auto
+LCO_MILLERS="001 010 100 011 101 110 111 012 021 102 120 201 210 112 121 211 122 212 221 104 113 018"
+LPO_MILLERS="001 010 100 011 101 110 111 012 021 102 120 201 210 112 121 211 122 212 221 301 410"
+                           # auto = ranked list, or explicit facets as above (the lists of the
+                           #   mace_explicit / uma_explicit runs)
 EXTRA_LCO_MILLERS=         # facets added to the list, e.g. "100 214"
 EXTRA_LPO_MILLERS=
 LCO_THICKNESS=15           # minimum slab thickness (A)
